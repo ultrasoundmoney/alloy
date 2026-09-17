@@ -2,7 +2,10 @@
 //!
 //! See also <https://flashbots.github.io/relay-specs/>
 
-use crate::{requests::ExecutionRequestsV4, BlsPublicKey, BlsSignature};
+use crate::{
+    requests::{ExecutionRequestsV4, ExecutionRequestsV5},
+    BlsPublicKey, BlsSignature,
+};
 use alloy_primitives::{Address, B256, U256};
 use alloy_rpc_types_engine::{
     BlobsBundleV1, BlobsBundleV2, ExecutionPayloadV1, ExecutionPayloadV2, ExecutionPayloadV3,
@@ -512,6 +515,82 @@ impl From<BuilderBlockValidationRequestV6> for alloy_rpc_types_engine::Execution
     }
 }
 
+/// Submission for the `/relay/v1/builder/blocks` endpoint (Amsterdam) with EIP-8282 builder
+/// requests.
+///
+/// Same shape as [`SignedBidSubmissionV6`], but `execution_requests` is the Amsterdam-complete
+/// [`ExecutionRequestsV5`], which adds the EIP-8282 builder deposit and exit request lists.
+/// Electra-shaped V6 bodies still deserialize (the builder request lists default to empty).
+#[serde_as]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "ssz", derive(ssz_derive::Decode, ssz_derive::Encode))]
+pub struct SignedBidSubmissionV7 {
+    /// The [`BidTrace`] message associated with the submission.
+    pub message: BidTrace,
+    /// The execution payload for the submission.
+    #[serde(with = "crate::payload::beacon_payload_v4")]
+    pub execution_payload: ExecutionPayloadV4,
+    /// The Amsterdam blob bundle for this bid.
+    pub blobs_bundle: BlobsBundleV2,
+    /// The Amsterdam execution requests for this bid.
+    pub execution_requests: ExecutionRequestsV5,
+    /// The signature associated with the submission.
+    pub signature: BlsSignature,
+}
+
+/// A Request to validate a [`SignedBidSubmissionV7`]
+#[serde_as]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BuilderBlockValidationRequestV7 {
+    /// The request to be validated.
+    #[serde(flatten)]
+    pub request: SignedBidSubmissionV7,
+    /// The registered gas limit for the validation request.
+    #[serde_as(as = "DisplayFromStr")]
+    pub registered_gas_limit: u64,
+    /// The parent beacon block root for the validation request.
+    pub parent_beacon_block_root: B256,
+}
+
+impl BuilderBlockValidationRequestV7 {
+    /// Converts this validation request to [`alloy_rpc_types_engine::ExecutionData`].
+    ///
+    /// Extracts the execution payload and creates the appropriate sidecar with versioned hashes and
+    /// execution requests.
+    #[cfg(all(feature = "sha2", feature = "ssz"))]
+    pub fn into_execution_data(self) -> alloy_rpc_types_engine::ExecutionData {
+        let versioned_hashes = self.request.blobs_bundle.versioned_hashes();
+
+        // Create Cancun payload fields
+        let cancun_fields = alloy_rpc_types_engine::CancunPayloadFields {
+            parent_beacon_block_root: self.parent_beacon_block_root,
+            versioned_hashes,
+        };
+
+        // Convert execution requests to Requests type
+        let prague_fields = alloy_rpc_types_engine::PraguePayloadFields::new(
+            self.request.execution_requests.to_requests(),
+        );
+
+        // Create the execution payload sidecar
+        let sidecar =
+            alloy_rpc_types_engine::ExecutionPayloadSidecar::v4(cancun_fields, prague_fields);
+
+        alloy_rpc_types_engine::ExecutionData::new(
+            alloy_rpc_types_engine::ExecutionPayload::V4(self.request.execution_payload),
+            sidecar,
+        )
+    }
+}
+
+#[cfg(all(feature = "sha2", feature = "ssz"))]
+impl From<BuilderBlockValidationRequestV7> for alloy_rpc_types_engine::ExecutionData {
+    fn from(request: BuilderBlockValidationRequestV7) -> Self {
+        request.into_execution_data()
+    }
+}
+
 /// Response type for the GET `/relay/v1/data/bidtraces/builder_blocks_received`
 ///
 /// Provides [BidTrace]s for payloads that were delivered to proposers.
@@ -859,6 +938,62 @@ mod tests {
 
         assert_eq!(bid, deserialized);
         assert_eq!(json, serde_json::to_value(deserialized).unwrap());
+    }
+
+    fn amsterdam_bid_submission_v7() -> SignedBidSubmissionV7 {
+        let bid_v6 = amsterdam_bid_submission_v6();
+
+        SignedBidSubmissionV7 {
+            message: bid_v6.message,
+            execution_payload: bid_v6.execution_payload,
+            blobs_bundle: bid_v6.blobs_bundle,
+            execution_requests: ExecutionRequestsV5 {
+                builder_deposits: vec![alloy_eips::eip8282::BuilderDepositRequest {
+                    pubkey: alloy_primitives::FixedBytes::repeat_byte(0x11),
+                    withdrawal_credentials: alloy_primitives::B256::repeat_byte(0x22),
+                    amount: 91_000_000_000,
+                    signature: alloy_primitives::FixedBytes::repeat_byte(0x33),
+                }],
+                builder_exits: vec![alloy_eips::eip8282::BuilderExitRequest {
+                    source_address: Address::repeat_byte(0x44),
+                    pubkey: alloy_primitives::FixedBytes::repeat_byte(0x55),
+                }],
+                ..bid_v6.execution_requests.into()
+            },
+            signature: bid_v6.signature,
+        }
+    }
+
+    #[test]
+    fn amsterdam_bid_submission_v7_roundtrip() {
+        let bid = amsterdam_bid_submission_v7();
+        let json = serde_json::to_value(&bid).unwrap();
+        let deserialized = serde_json::from_value::<SignedBidSubmissionV7>(json.clone()).unwrap();
+
+        assert_eq!(bid, deserialized);
+        assert_eq!(json, serde_json::to_value(deserialized).unwrap());
+    }
+
+    #[test]
+    fn amsterdam_bid_submission_v7_accepts_electra_shaped_v6_body() {
+        let bid_v6 = amsterdam_bid_submission_v6();
+        let json = serde_json::to_value(&bid_v6).unwrap();
+
+        let bid_v7 = serde_json::from_value::<SignedBidSubmissionV7>(json).unwrap();
+        assert_eq!(bid_v7.execution_requests, bid_v6.execution_requests.clone().into());
+        assert!(bid_v7.execution_requests.builder_deposits.is_empty());
+        assert!(bid_v7.execution_requests.builder_exits.is_empty());
+        assert_eq!(bid_v7.execution_payload, bid_v6.execution_payload);
+    }
+
+    #[cfg(feature = "ssz")]
+    #[test]
+    fn amsterdam_bid_submission_v7_requests_roundtrip() {
+        let bid = amsterdam_bid_submission_v7();
+
+        let requests = bid.execution_requests.to_requests();
+        let recovered = ExecutionRequestsV5::try_from(&requests).unwrap();
+        assert_eq!(recovered, bid.execution_requests);
     }
 
     #[cfg(feature = "ssz")]
